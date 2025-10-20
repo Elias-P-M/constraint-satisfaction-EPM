@@ -1,0 +1,9 @@
+name: constraint-satisfaction
+dependencies:
+  - python=3.11
+  - scikit-learn
+  - matplotlib
+  - pandas
+  - numpy
+  - scipy
+  - pip
