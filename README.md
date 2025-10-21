@@ -95,14 +95,22 @@ Pugh ratio > 2.5, and single-phase BCC at 600 °C.
 ## Sanitised design space
 
 For distribution we ship `design_space_sanitized.csv`, which mirrors the schema
-expected by the campaign scripts while obscuring Thermo-Calc outputs:
+expected by the campaign scripts while obscuring Thermo-Calc outputs. The
+sanitiser performs the following transformations:
 
-1. Elemental fraction columns have been replaced with anonymous placeholders
-   (`element_01`, …).
-2. All columns beginning with `PROP` or `EQUIL`, as well as the prior columns,
-   are min–max scaled into `[0, 1]`.
-3. Every numeric column receives a ±1 % multiplicative jitter (clipped to
-   sensible bounds) to prevent reconstruction of the exact Thermo-Calc values.
+1. **Column pruning.** Only the fields the code actually touches are retained:
+   Nb/Mo/Ta/V/W/Cr fractions, the prior/objective columns listed in the scripts,
+   and the 600 °C BCC phase-fraction columns used to build the single-phase flag.
+2. **Element obfuscation.** The six elemental fractions are renamed to
+   `element_01` … `element_06`.
+3. **Scaling.** Every column that starts with `PROP` or `EQUIL`, as well as the
+   prior columns (e.g. `YS 600 C PRIOR`, `PROP ST (K)`, `VEC Avg`), is min–max
+   scaled into `[0, 1]`.
+4. **Noise injection.** A ±1 % multiplicative jitter (clipped to sensible bounds)
+   is applied to all numeric columns to mask the exact Thermo-Calc outputs.
+5. **Threshold handling.** The campaign scripts automatically detect whether the
+   scaled dataset is in use and swap to the corresponding scaled thresholds for
+   density, yield strength, Pugh ratio, solidus temperature, and VEC.
 
 If you have access to the original `design_space.xlsx` you can regenerate the
 sanitised file locally, but end users only need the CSV shipped here.
