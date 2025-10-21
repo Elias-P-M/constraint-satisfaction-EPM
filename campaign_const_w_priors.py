@@ -73,6 +73,21 @@ BCC_SINGLE_VALUE = 5.0
 # Will hold dataset-fixed ranges for scaled HV
 FIXED_RANGES: Optional[np.ndarray] = None  # (4,)
 
+# Accept multiple dataset filenames (new default: design_space.xlsx)
+DATA_CANDIDATES = ("design_space.xlsx", "design_space.csv", "EQUIL_STITCH.csv")
+
+
+def load_design_space() -> pd.DataFrame:
+    """Load the design space from whichever supported file is present."""
+    for path in DATA_CANDIDATES:
+        if os.path.exists(path):
+            if path.lower().endswith(".xlsx"):
+                return pd.read_excel(path)
+            return pd.read_csv(path)
+    raise FileNotFoundError(
+        f"None of the expected files were found: {', '.join(DATA_CANDIDATES)}"
+    )
+
 # =================== Hypervolume (EXACT; NOT EHVI) ===================
 
 def _pareto_filter_non_dominated(P: np.ndarray) -> np.ndarray:
@@ -278,7 +293,7 @@ def run_campaign(seed: int = 0, iterations: int = 100) -> None:
 
     print(f"Running campaign seed={seed}")
 
-    splice = pd.read_csv("EQUIL_STITCH.csv")
+    splice = load_design_space()
     df = prepare_dataframe(splice)
 
     truth_pass = (
