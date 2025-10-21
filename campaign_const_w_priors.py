@@ -74,18 +74,18 @@ BCC_SINGLE_VALUE = 5.0
 FIXED_RANGES: Optional[np.ndarray] = None  # (4,)
 
 # Accept multiple dataset filenames (new default: design_space.xlsx)
-DATA_CANDIDATES = ("design_space.xlsx", "design_space.csv", "EQUIL_STITCH.csv")
+DATA_CANDIDATES = ("design_space.xlsx", "design_space.csv")
 
 
 def load_design_space() -> pd.DataFrame:
-    """Load the design space from whichever supported file is present."""
+    """Load the design space from design_space.(xlsx|csv)."""
     for path in DATA_CANDIDATES:
         if os.path.exists(path):
             if path.lower().endswith(".xlsx"):
                 return pd.read_excel(path)
             return pd.read_csv(path)
     raise FileNotFoundError(
-        f"None of the expected files were found: {', '.join(DATA_CANDIDATES)}"
+        "Expected design_space.xlsx or design_space.csv in this directory."
     )
 
 # =================== Hypervolume (EXACT; NOT EHVI) ===================

@@ -29,8 +29,8 @@ maps, feasibility probabilities, etc.).
 
 ## Data requirements
 
-The scripts look for `design_space.xlsx` (preferred), `design_space.csv`, or
-the legacy `EQUIL_STITCH.csv` in this directory. The chosen file must supply:
+The scripts look for `design_space.xlsx` (preferred) or `design_space.csv` in
+this directory. The chosen file must supply:
 
 - Objective/prior columns: `YS 600 C PRIOR`, `YS 25C PRIOR`,
   `PROP 25C Density (g/cm3)`, `Density Avg`, `Pugh_Ratio_PRIOR`,
