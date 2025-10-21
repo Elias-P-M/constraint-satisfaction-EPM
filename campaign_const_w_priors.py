@@ -21,6 +21,7 @@ Priors (enabled as requested):
 from __future__ import annotations
 
 import os
+import json
 import time
 from dataclasses import dataclass
 from typing import Tuple, Iterable, Optional, List
@@ -54,6 +55,8 @@ DENSITY_THRESH = 9.0    # g/cm^3 (must be <)
 YS_THRESH = 700         # MPa      (must be >)
 PUGH_THRESH = 2.5       #          (must be >)
 
+THRESHOLD_FILE = "constraints_scaled.json"
+
 # Reference point r in the *maximize* space [ST, -Density, YS, Pugh]
 REF_ST = 0
 REF_DENSITY = 30
@@ -69,6 +72,7 @@ ELEM_COLS = ["Nb", "Mo", "Ta", "V", "W", "Cr"]
 
 # Single-phase BCC truth flag (5 == single-phase, -5 otherwise)
 BCC_SINGLE_VALUE = 5.0
+VEC_THRESHOLD = 6.87
 
 # Will hold dataset-fixed ranges for scaled HV
 FIXED_RANGES: Optional[np.ndarray] = None  # (4,)
@@ -87,6 +91,15 @@ def load_design_space() -> pd.DataFrame:
     raise FileNotFoundError(
         "Expected design_space.xlsx or design_space.csv in this directory."
     )
+
+# =================== Threshold overrides ===================
+
+def load_threshold_overrides() -> Dict[str, float]:
+    if not os.path.exists(THRESHOLD_FILE):
+        return {}
+    with open(THRESHOLD_FILE, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    return {k: float(v) for k, v in data.items()}
 
 # =================== Hypervolume (EXACT; NOT EHVI) ===================
 
@@ -217,8 +230,8 @@ def prepare_dataframe(splice: pd.DataFrame) -> pd.DataFrame:
     df["600C BCC Total"] = splice[cols_600_bcc].sum(axis=1)
     df["600C BCC Total"] = np.where(df["600C BCC Total"] > 0.99, 5.0, -5.0)
 
-    #VEC prior → latent ±5 with threshold 6.87 (use 'VEC' then fallback to 'VEC Avg')
-    threshold = 6.87
+    #VEC prior → latent ±5 with threshold (use 'VEC' then fallback to 'VEC Avg')
+    threshold = VEC_THRESHOLD
     vec_col = "VEC" if "VEC" in splice.columns else ("VEC Avg" if "VEC Avg" in splice.columns else None)
     if vec_col is None:
         raise ValueError("Neither 'VEC' nor 'VEC Avg' found in splice columns.")
@@ -292,6 +305,15 @@ def run_campaign(seed: int = 0, iterations: int = 100) -> None:
     os.makedirs(PLOTS_DIR, exist_ok=True)
 
     print(f"Running campaign seed={seed}")
+
+    overrides = load_threshold_overrides()
+    if overrides:
+        global DENSITY_THRESH, YS_THRESH, PUGH_THRESH, ST_THRESH, VEC_THRESHOLD
+        DENSITY_THRESH = float(overrides.get("PROP 25C Density (g/cm3)", DENSITY_THRESH))
+        YS_THRESH = float(overrides.get("YS 600 C PRIOR", YS_THRESH))
+        PUGH_THRESH = float(overrides.get("Pugh_Ratio_PRIOR", PUGH_THRESH))
+        ST_THRESH = float(overrides.get("PROP ST (K)", ST_THRESH))
+        VEC_THRESHOLD = float(overrides.get("VEC Avg", overrides.get("VEC", VEC_THRESHOLD)))
 
     splice = load_design_space()
     df = prepare_dataframe(splice)

@@ -27,9 +27,10 @@ Author: Brent + ChatGPT
 from __future__ import annotations
 
 import os
+import json
 import time
 from dataclasses import dataclass
-from typing import Tuple, Iterable, Optional
+from typing import Tuple, Iterable, Optional, Dict
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import multiprocessing as mp
 
@@ -69,6 +70,8 @@ DENSITY_THRESH = 9.0
 YS_THRESH = 700
 PUGH_THRESH = 2.5
 
+THRESHOLD_FILE = "constraints_scaled.json"
+
 REF_ST = 0
 REF_DENSITY = 30
 REF_YS = 0
@@ -84,6 +87,7 @@ ELEM_COLS = ["Nb", "Mo", "Ta", "V", "W", "Cr"]
 
 # Single-phase BCC truth flag (5 == single-phase, -5 otherwise)
 BCC_SINGLE_VALUE = 5.0
+VEC_THRESHOLD = 6.87
 
 # ---- Fixed scaling (computed ONCE at start of each seed run) ----
 # Choose whether to compute fixed ranges over ALL rows or only BCC-single rows.
