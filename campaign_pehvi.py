@@ -81,7 +81,7 @@ REF_POINT = np.array([REF_ST, -REF_DENSITY, REF_YS, REF_PUGH], dtype=float)
 EPS = 1e-12
 
 # Elemental columns used as inputs
-ELEM_COLS = ["Nb", "Mo", "Ta", "V", "W", "Cr"]
+ELEM_COLS = ["element_01",	"element_02",	"element_03",	"element_04",	"element_05",	"element_06"]
 
 # Single-phase BCC truth flag (5 == single-phase, -5 otherwise)
 BCC_SINGLE_VALUE = 5.0
@@ -239,9 +239,13 @@ def prepare_dataframe(splice: pd.DataFrame) -> pd.DataFrame:
 
     # BCC prior: default 50/50 → logit(0.5) = 0.0 everywhere
     df["VEC (BCC Prior)"] = 0.0
+    
+    missing_cols = [c for c in ELEM_COLS if c not in splice.columns]
+    if missing_cols:
+        raise ValueError(f"Missing elemental columns: {missing_cols}")
 
-    # Elemental composition columns (assumed at slice 6:12)
-    df = df.merge(splice.iloc[:, 6:12], left_index=True, right_index=True)
+    df = df.merge(splice[ELEM_COLS], left_index=True, right_index=True)
+
 
     # Clean NA and reset index
     df = df.dropna().reset_index(drop=True)
