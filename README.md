@@ -18,6 +18,11 @@ plots.
 - `campaign_pehvi.py` – probability of expected hypervolume improvement (pEHVI)
   guided search. The acquisition combines pEHVI in the maximisation space with
   a probability of satisfying the BCC constraint.
+- `campaign_ehvi_pof.py` – EHVI × POF baseline. The acquisition multiplies EHVI
+  by the probability of feasibility across all constraints (including BCC).
+- `campaign_ehvi_pofcorr.py` – EHVI × correlated POF (Gaussian copula).
+- `campaign_random.py` – random acquisition baseline. Each iteration uniformly
+  selects a new point from the remaining pool (no replacement).
 - `constraint-satisfaction.yml` – a lightweight conda environment specification
   (Python 3.11, scikit-learn, SciPy stack).
 - `LICENSE` – MIT licence terms.
@@ -84,6 +89,8 @@ Common flags:
 - `--results-dir`, `--plots-dir` change output locations.
 - `--density-thresh`, `--ys-thresh`, `--pugh-thresh`, `--st-thresh`, `--vec-thresh`
   override feasibility thresholds (otherwise auto-detected for scaled vs raw data).
+- `--plot-affine` enables affine simplex progress plots (saved per seed).
+- `--plot-every N` plots every N iterations (default 1).
 
 `campaign_pehvi.py` adds:
 - `--fixed-range-scope {ALL,BCC_ONLY}` to control fixed-range HV scaling
@@ -94,8 +101,10 @@ Original defaults (before CLI overrides):
 - `--iterations`: `100`
 - `--workers`: `25`
 - `--data-path`: auto-detect `design_space.xlsx` or `design_space.csv` in the repo
-- `--results-dir`: `results_const_prior` / `results_const_no_prior` / `results_opt`
-- `--plots-dir`: `plots_seed_###` subfolders in the current working directory
+- `--results-dir` / `--plots-dir`: auto-generated using
+  `{date}_{method}{-prior|-noprior}_{acq}_{data}_{seeds}x{iters}`
+  (e.g., `results_2026-02-01_const-prior_feasibility_raw_20x30`,
+  `plots_2026-02-01_opt-noprior_pehvi_scaled_20x30`).
 - Raw-data thresholds: solidus > 2473 K, density < 9.0 g cm⁻³, yield strength > 700 MPa,
   Pugh ratio > 2.5, VEC >= 6.87
 - Scaled-data thresholds (auto-detected): solidus > 0.3340611, density < 0.2189121,
@@ -193,6 +202,9 @@ Elemental fractions (input features):
 | `campaign_const_w_priors.py`  | Feasibility-first selection using informative priors          | `results_const_prior`    |
 | `campaign_const_NO_priors.py` | Same as above but without priors (pure GP learning)           | `results_const_no_prior` |
 | `campaign_pehvi.py`           | Optimisation-first search via closed-form pEHVI × p_bcc       | `results_opt`            |
+| `campaign_ehvi_pof.py`        | Optimisation baseline: EHVI × POF (all constraints)           | `results_ehvi_pof`       |
+| `campaign_ehvi_pofcorr.py`    | Optimisation baseline: EHVI × correlated POF (copula)         | `results_ehvi_pofcorr`   |
+| `campaign_random.py`          | Random baseline (uniform sampling without replacement)       | `results_random`         |
 
 All configurations share the same feasibility thresholds:
 solidus > 2473 K, density < 9.0 g cm⁻³, yield strength > 700 MPa,
@@ -230,6 +242,26 @@ sanitised file locally, but end users only need the CSV shipped here.
   folder – the scripts will append to the per-seed CSV if it already exists.
 - For large design spaces consider pre-filtering to BCC-feasible rows to reduce
   the cost of GP training in the early iterations.
+
+## Reproducing runs
+
+If you use the auto-naming scheme, you can rerun all saved campaigns and
+regenerate stitched CSVs + metric plots:
+
+```bash
+python reproduce_results.py
+```
+
+This will:
+- rerun every `results_*` directory whose name matches the run-name pattern,
+- write stitched CSVs inside each results folder,
+- regenerate metric-vs-iteration plots in `plots_metrics_all/`.
+
+Use `--reset` to delete existing results/plots for those runs before rerunning:
+
+```bash
+python reproduce_results.py --reset
+```
 
 Feel free to adapt the scripts for new alloys or alternative constraint sets –
 most of the logic is localised inside `prepare_dataframe` and `build_models`.

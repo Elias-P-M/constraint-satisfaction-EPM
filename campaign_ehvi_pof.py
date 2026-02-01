@@ -1,31 +1,40 @@
 #!/usr/bin/env python3
 """
-Feasibility-first active learning (constraints-first) with priors enabled.
+Active learning with EHVI × POF (probability of feasibility):
 
-- Acquisition: acq_full = Total_Prob_With_BCC
-- Logs fixed-range scaled HV (AFTER pick) to keep apples-to-apples with MOBO.
-- Flags if the chosen point is Pareto on the measured set after adding it.
-- Plots:
-  * Progress plot each iter colored by p_Pugh
-  * Per-objective prediction maps each iter (ST, Density, YS, Pugh, p_BCC)
-  * TRUE feasible alloys overlaid as WHITE CROSSES on top
+- Acquisition: EHVI([ST, -Density, YS, Pugh]) in per-iteration
+  shifted+scaled space (shift by REF_POINT, divide by per-iter ranges).
+- Selection uses acquisition = EHVI(...) * POF(all constraints incl. BCC).
 
-Priors (enabled as requested):
-- YS Prior         = splice['YS 25C PRIOR'] + N(0, 50)
-- Density Prior    = splice['Density Avg'] + N(0, 0.5)
-- ST Prior (Tm)    = splice['Tm Avg']
-- VEC (BCC Prior)  = ±5 with threshold 6.87 (uses 'VEC' or 'VEC Avg' if present)
-- 600C BCC Total   = ±5 (sum of 600C BCC cols > 0.99 ⇒ +5, else -5)
+- Reporting (non-changing hypervolume):
+  * Compute ONE fixed scaling at the start (per seed) from dataset min/max
+    of the four objectives (maximize space). Switch scope via FIXED_RANGE_SCOPE.
+  * Each iteration we report:
+      - HypervolumeScaledFixedRange : HV of measured set in that fixed scale
+      - Hypervolume                 : HV in raw units (monotone)
+
+- NEW: CSV includes ChosenIsParetoMeasured = "Yes"/"No"
+  "Yes" iff the just-chosen point is in the nondominated set of the
+  measured set AFTER it’s added (when BCC-single). Otherwise "No".
+
+Outputs:
+- CSV: results_opt/campaign_<seed>.csv (appended per iteration)
+- Plots per iteration into plots_seed_<seed>/
+
+Author: Brent + ChatGPT
 """
 
 from __future__ import annotations
 
 import os
+import json
 import time
 import argparse
 import datetime
 from dataclasses import dataclass
-from typing import Tuple, Iterable, Optional, List
+from typing import Tuple, Iterable, Optional
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import multiprocessing as mp
 
 import numpy as np
 import pandas as pd
@@ -41,8 +50,6 @@ from sklearn.metrics import (
     brier_score_loss, log_loss
 )
 
-from concurrent.futures import ProcessPoolExecutor, as_completed
-
 # ---- Quiet mode: mute warnings ----
 import warnings
 from sklearn.exceptions import ConvergenceWarning
@@ -54,19 +61,20 @@ warnings.filterwarnings("ignore", category=OptimizeWarning)
 
 # =================== CONFIG / CONSTANTS ===================
 
-RESULTS_DIR = "results_const_prior"
-PLOTS_DIR = "results_const_prior"           # overridden per-seed by _run_seed
-PLOT_PREFIX = "affine_progress_prior"       # overridden per-seed by _run_seed
-PRED_PLOT_PREFIX = "affine_pred_prior"      # overridden per-seed by _run_seed
-PLOTS_BASE_DIR = "plots_const_prior"
+RESULTS_DIR = "results_ehvi_pof"
+PLOTS_DIR = "results_opt"
+PLOT_PREFIX = "affine_progress_ehvipof"
+PRED_PLOT_PREFIX = "affine_pred_ehvipof"
+PLOTS_BASE_DIR = "plots_ehvi_pof"
 PLOT_AFFINE = False
 PLOT_EVERY = 1
+PARETO_BCC_MASK: Optional[np.ndarray] = None
 
 # Feasibility thresholds (defaults; overridden per dataset or CLI)
-DEFAULT_ST_THRESH = 2200 + 273  # K
-DEFAULT_DENSITY_THRESH = 9.0    # g/cm^3 (must be <)
-DEFAULT_YS_THRESH = 700         # MPa      (must be >)
-DEFAULT_PUGH_THRESH = 2.5       #          (must be >)
+DEFAULT_ST_THRESH = 2200 + 273
+DEFAULT_DENSITY_THRESH = 9.0
+DEFAULT_YS_THRESH = 700
+DEFAULT_PUGH_THRESH = 2.5
 DEFAULT_VEC_THRESHOLD = 6.87
 ST_THRESH: Optional[float] = None
 DENSITY_THRESH: Optional[float] = None
@@ -74,11 +82,11 @@ YS_THRESH: Optional[float] = None
 PUGH_THRESH: Optional[float] = None
 VEC_THRESHOLD: Optional[float] = None
 
-# Reference point r in the *maximize* space [ST, -Density, YS, Pugh]
 REF_ST = 0
 REF_DENSITY = 30
 REF_YS = 0
 REF_PUGH = 0
+# Reference point in the *maximize* space [ST, -Density, YS, Pugh]
 REF_POINT = np.array([REF_ST, -REF_DENSITY, REF_YS, REF_PUGH], dtype=float)
 
 # Numerical safety
@@ -87,12 +95,14 @@ EPS = 1e-12
 # Elemental columns used as inputs
 ELEM_COLS = ["element_01",	"element_02",	"element_03",	"element_04",	"element_05",	"element_06"]
 
-
 # Single-phase BCC truth flag (5 == single-phase, -5 otherwise)
 BCC_SINGLE_VALUE = 5.0
+VEC_THRESHOLD = 6.87
 
-# Will hold dataset-fixed ranges for scaled HV
-FIXED_RANGES: Optional[np.ndarray] = None  # (4,)
+# ---- Fixed scaling (computed ONCE at start of each seed run) ----
+# Choose whether to compute fixed ranges over ALL rows or only BCC-single rows.
+FIXED_RANGE_SCOPE = "ALL"     # "ALL" | "BCC_ONLY"
+FIXED_RANGES = None           # np.ndarray shape (4,)
 
 DATA_CANDIDATES = ("design_space.xlsx", "design_space.csv")
 DATA_PATH: Optional[str] = None
@@ -123,14 +133,15 @@ def infer_scaled_space(path: Optional[str] = None) -> bool:
 
 def build_run_name(seeds: list[int], iterations: int, data_tag: str) -> str:
     date_str = datetime.date.today().isoformat()
-    method = "const"
-    prior_tag = "-prior"
-    acq = "feasibility"
+    method = "opt"
+    prior_tag = "-noprior"
+    acq = "ehvipof"
     return f"{date_str}_{method}{prior_tag}_{acq}_{data_tag}_{len(seeds)}x{iterations}"
 
 # =================== Hypervolume (EXACT; NOT EHVI) ===================
 
 def _pareto_filter_non_dominated(P: np.ndarray) -> np.ndarray:
+    """Keep points not dominated by any other (>= in all dims and > in at least one)."""
     if P.size == 0:
         return P
     K = P.shape[0]
@@ -147,6 +158,7 @@ def _pareto_filter_non_dominated(P: np.ndarray) -> np.ndarray:
     return P[keep]
 
 def _hypervolume_recursive(P: np.ndarray) -> float:
+    """Exact HV of union of boxes [0, p_i] in R^m via recursive slicing on the last dimension."""
     P = _pareto_filter_non_dominated(P)
     if P.size == 0:
         return 0.0
@@ -167,14 +179,16 @@ def _hypervolume_recursive(P: np.ndarray) -> float:
     return float(vol)
 
 def hypervolume_exact(points_max_space: np.ndarray, ref_point: np.ndarray) -> float:
+    """Exact dominated hypervolume of `points_max_space` (maximize convention) w.r.t. `ref_point`."""
     if points_max_space.size == 0:
         return 0.0
-    P = np.maximum(points_max_space - ref_point, 0.0)
+    P = np.maximum(points_max_space - ref_point, 0.0)  # shift to ref and clamp to +orthant
     if np.all(P <= 0.0):
         return 0.0
     return _hypervolume_recursive(P)
 
 def nondominated_mask(points: np.ndarray) -> np.ndarray:
+    """General non-dominated mask in maximize space (no positivity assumption)."""
     if points.size == 0:
         return np.zeros((0,), dtype=bool)
     K = points.shape[0]
@@ -190,15 +204,14 @@ def nondominated_mask(points: np.ndarray) -> np.ndarray:
                 break
     return keep
 
-def hypervolume_in_scaled_space(points_max_space: np.ndarray,
+def hypervolume_in_scaled_space(pareto_obs: np.ndarray,
                                 ref_point: np.ndarray,
                                 ranges: np.ndarray) -> float:
-    """HV in shifted+scaled maximize space (shift by REF_POINT, divide by fixed per-dim ranges)."""
-    if points_max_space.size == 0:
-        return 0.0
-    shifted = points_max_space - ref_point
+    """HV in shifted+scaled maximize space (shift by REF_POINT, divide by per-dim 'ranges')."""
+    shifted = pareto_obs - ref_point
     scaled  = shifted / np.maximum(ranges, EPS)
     return hypervolume_exact(scaled, np.zeros_like(ref_point))
+
 
 # =================== Data structures & helpers ===================
 
@@ -209,6 +222,142 @@ class Models:
     pugh: GaussianProcessRegressor
     bcc: GaussianProcessRegressor
     st: GaussianProcessRegressor
+
+def ensure_dir(path: str) -> None:
+    if path and not os.path.exists(path):
+        os.makemks(path, exist_ok=True)
+
+def _polygon_vertices(n: int) -> np.ndarray:
+    """Regular n-gon vertices on the unit circle."""
+    angles = np.linspace(0, 2 * np.pi, n, endpoint=False)
+    return np.column_stack([np.cos(angles), np.sin(angles)])
+
+def _simplex_project_2d(weights: np.ndarray) -> np.ndarray:
+    """Project element-fraction weights onto a 2D regular n-gon."""
+    n = weights.shape[1]
+    verts = _polygon_vertices(n)
+    return weights @ verts
+
+def _compute_pareto_bcc_mask(df: pd.DataFrame) -> np.ndarray:
+    """Compute ground-truth Pareto mask restricted to BCC single-phase points."""
+    bcc_cols = [c for c in df.columns if ("600C" in c and "BCC" in c)]
+    if not bcc_cols:
+        return np.zeros(len(df), dtype=bool)
+    bcc_single = (df[bcc_cols].sum(axis=1) > 0.99).to_numpy()
+    obj = np.column_stack([
+        df["Solidus Temp"].to_numpy(float),
+        -df["Density"].to_numpy(float),
+        df["YS 600C"].to_numpy(float),
+        df["Pugh Ratio"].to_numpy(float),
+    ])
+    idx = np.where(bcc_single)[0]
+    P = obj[idx]
+    order = np.argsort(-P[:, 0])
+    P_sorted = P[order]
+    idx_sorted = idx[order]
+
+    front: list[int] = []
+    front_objs = np.empty((0, P.shape[1]), dtype=float)
+    for i, p in enumerate(P_sorted):
+        if front_objs.size:
+            ge = np.all(front_objs >= p, axis=1)
+            gt = np.any(front_objs > p, axis=1)
+            if np.any(ge & gt):
+                continue
+            le = np.all(p >= front_objs, axis=1)
+            lt = np.any(p > front_objs, axis=1)
+            keep = ~(le & lt)
+            if not np.all(keep):
+                front_objs = front_objs[keep]
+                front = [f for k, f in zip(keep.tolist(), front) if k]
+        front.append(int(idx_sorted[i]))
+        front_objs = np.vstack([front_objs, p])
+
+    pareto_mask = np.zeros(len(df), dtype=bool)
+    pareto_mask[np.array(front, dtype=int)] = True
+    return pareto_mask
+
+def plot_affine_simplex_progress(
+    df: pd.DataFrame,
+    measured_indices: set[int],
+    total_prob_with_bcc: np.ndarray,
+    iteration: int,
+    last_idx: Optional[int] = None,
+    pareto_mask: Optional[np.ndarray] = None,
+    feasible_mask: Optional[np.ndarray] = None,
+) -> None:
+    if not PLOT_AFFINE or (iteration % PLOT_EVERY != 0):
+        return
+    elem = df[ELEM_COLS].to_numpy(float)
+    elem = np.clip(elem, 0.0, None)
+    sums = elem.sum(axis=1)
+    mask = sums > 0
+    if not np.any(mask):
+        return
+    weights = elem[mask] / sums[mask][:, None]
+    coords = _simplex_project_2d(weights)
+    colors = total_prob_with_bcc[mask]
+
+    order = np.argsort(colors)
+    coords = coords[order]
+    colors = colors[order]
+    ordered_idx = np.where(mask)[0][order]
+
+    fig, ax = plt.subplots(figsize=(6, 5))
+    sc = ax.scatter(coords[:, 0], coords[:, 1], c=colors, cmap="viridis", s=10, alpha=0.5)
+    if measured_indices:
+        meas = np.array(sorted(measured_indices), dtype=int)
+        meas = meas[(meas >= 0) & (meas < mask.shape[0])]
+        meas = meas[mask[meas]]
+        if meas.size > 0:
+            meas_idx = np.where(np.isin(ordered_idx, meas))[0]
+            ax.scatter(coords[meas_idx, 0], coords[meas_idx, 1],
+                       s=30, facecolors="none", edgecolors="white", linewidths=0.8, alpha=0.9, zorder=3)
+    if last_idx is not None and last_idx in np.where(mask)[0]:
+        last_pos = np.where(ordered_idx == last_idx)[0][0]
+        ax.scatter(coords[last_pos, 0], coords[last_pos, 1],
+                   s=80, facecolors="none", edgecolors="red", linewidths=1.5, zorder=6)
+
+    if pareto_mask is not None and measured_indices:
+        pareto_idx = np.where(pareto_mask)[0]
+        mp = np.array(sorted(measured_indices), dtype=int)
+        mp = mp[np.isin(mp, pareto_idx)]
+        if mp.size > 0:
+            mp_idx = np.where(np.isin(ordered_idx, mp))[0]
+            ax.scatter(coords[mp_idx, 0], coords[mp_idx, 1],
+                       s=80, marker="*", facecolors="blue", edgecolors="blue",
+                       linewidths=0.6, alpha=0.95, zorder=5, label="Queried Pareto (BCC)")
+
+    if feasible_mask is not None and measured_indices:
+        feasible_idx = np.where(feasible_mask)[0]
+        mf = np.array(sorted(measured_indices), dtype=int)
+        mf = mf[np.isin(mf, feasible_idx)]
+        if mf.size > 0:
+            mf_idx = np.where(np.isin(ordered_idx, mf))[0]
+            ax.scatter(coords[mf_idx, 0], coords[mf_idx, 1],
+                       s=110, marker="*", facecolors="red", edgecolors="red",
+                       linewidths=0.6, alpha=0.95, zorder=6, label="Queried Feasible (All constraints)")
+
+    verts = _polygon_vertices(len(ELEM_COLS))
+    ax.plot(np.append(verts[:, 0], verts[0, 0]), np.append(verts[:, 1], verts[0, 1]), color="black", lw=1.0)
+    for i, (x, y) in enumerate(verts):
+        ax.text(x * 1.08, y * 1.08, ELEM_COLS[i], ha="center", va="center", fontsize=8)
+
+    ax.set_title(f"Affine Simplex Progress (iter {iteration:03d})")
+    ax.set_xlabel("Simplex X")
+    ax.set_ylabel("Simplex Y")
+    ax.set_aspect("equal", "box")
+    ax.set_xlim(-1.15, 1.15)
+    ax.set_ylim(-1.15, 1.15)
+    ax.set_axis_off()
+    ax.legend(frameon=False, loc="lower right")
+    fig.colorbar(sc, ax=ax, shrink=0.75, pad=0.02, label="Pred_Prob_With_BCC")
+    fig.tight_layout()
+
+    os.makedirs(PLOTS_DIR, exist_ok=True)
+    out_path = os.path.join(PLOTS_DIR, f"{PLOT_PREFIX}_iter{iteration:03d}.png")
+    fig.savefig(out_path, dpi=200)
+    plt.close(fig)
 
 def build_models(seed: int) -> Models:
     base_kernel = RBF(length_scale=[1.0] * len(ELEM_COLS),
@@ -234,127 +383,40 @@ def build_models(seed: int) -> Models:
         st=mk_norm(),
     )
 
-def _polygon_vertices(n: int) -> np.ndarray:
-    """Regular n-gon vertices on the unit circle."""
-    angles = np.linspace(0, 2 * np.pi, n, endpoint=False)
-    return np.column_stack([np.cos(angles), np.sin(angles)])
-
-def _simplex_project_2d(weights: np.ndarray) -> np.ndarray:
-    """Project element-fraction weights onto a 2D regular n-gon."""
-    n = weights.shape[1]
-    verts = _polygon_vertices(n)
-    return weights @ verts
-
-def plot_affine_simplex_progress(
-    df: pd.DataFrame,
-    measured_indices: set[int],
-    total_prob_with_bcc: np.ndarray,
-    iteration: int,
-    last_idx: Optional[int] = None,
-) -> None:
-    if not PLOT_AFFINE or (iteration % PLOT_EVERY != 0):
-        return
-    elem = df[ELEM_COLS].to_numpy(float)
-    elem = np.clip(elem, 0.0, None)
-    sums = elem.sum(axis=1)
-    mask = sums > 0
-    if not np.any(mask):
-        return
-    weights = elem[mask] / sums[mask][:, None]
-    coords = _simplex_project_2d(weights)
-    colors = total_prob_with_bcc[mask]
-
-    order = np.argsort(colors)
-    coords = coords[order]
-    colors = colors[order]
-
-    fig, ax = plt.subplots(figsize=(6, 5))
-    sc = ax.scatter(coords[:, 0], coords[:, 1], c=colors, cmap="viridis", s=10, alpha=0.5)
-    if measured_indices:
-        meas = np.array(sorted(measured_indices), dtype=int)
-        meas = meas[(meas >= 0) & (meas < mask.shape[0])]
-        meas = meas[mask[meas]]
-        if meas.size > 0:
-            meas_positions = np.where(mask)[0]
-            meas_idx = np.where(np.isin(meas_positions, meas))[0]
-            meas_idx = np.array([np.where(order == i)[0][0] for i in meas_idx])
-            ax.scatter(coords[meas_idx, 0], coords[meas_idx, 1],
-                       s=30, facecolors="none", edgecolors="white", linewidths=0.8, alpha=0.9)
-    if last_idx is not None and last_idx in np.where(mask)[0]:
-        last_pos = np.where(np.where(mask)[0] == last_idx)[0][0]
-        last_pos = np.where(order == last_pos)[0][0]
-        ax.scatter(coords[last_pos, 0], coords[last_pos, 1],
-                   s=80, facecolors="none", edgecolors="red", linewidths=1.5)
-
-    verts = _polygon_vertices(len(ELEM_COLS))
-    ax.plot(np.append(verts[:, 0], verts[0, 0]), np.append(verts[:, 1], verts[0, 1]), color="black", lw=1.0)
-    for i, (x, y) in enumerate(verts):
-        ax.text(x * 1.08, y * 1.08, ELEM_COLS[i], ha="center", va="center", fontsize=8)
-
-    ax.set_title(f"Affine Simplex Progress (iter {iteration:03d})")
-    ax.set_xlabel("Simplex X")
-    ax.set_ylabel("Simplex Y")
-    ax.set_aspect("equal", "box")
-    ax.set_xlim(-1.15, 1.15)
-    ax.set_ylim(-1.15, 1.15)
-    ax.set_axis_off()
-    fig.colorbar(sc, ax=ax, shrink=0.75, pad=0.02, label="Pred_Prob_With_BCC")
-    fig.tight_layout()
-
-    os.makedirs(PLOTS_DIR, exist_ok=True)
-    out_path = os.path.join(PLOTS_DIR, f"{PLOT_PREFIX}_iter{iteration:03d}.png")
-    fig.savefig(out_path, dpi=200)
-    plt.close(fig)
-
 def prepare_dataframe(splice: pd.DataFrame) -> pd.DataFrame:
-    """
-    Enable priors as requested; attach elemental fractions; build BCC targets.
-    """
+    """Create the working dataframe with priors and truth columns."""
     df = pd.DataFrame()
-
-    # ---- Objectives and their priors ----
     df["YS 600C"] = splice["YS 600 C PRIOR"]
-    df["YS Prior"] = splice['YS 25C PRIOR'] #+ np.random.normal(0, 50, size=splice.shape[0])
+    df["YS Prior"] = 0.0
 
     df["Density"] = splice["PROP 25C Density (g/cm3)"]
-    df["Density Prior"] = splice['Density Avg'] #+ np.random.normal(0, 0.5, size=splice.shape[0])
+    df["Density Prior"] = 0.0
 
     df["Pugh Ratio"] = splice["Pugh_Ratio_PRIOR"]
+    df["Solidus Temp"] = splice["PROP ST (K)"]
+    df["Melting Temp (ST Prior)"] = 0.0
 
-    df["Solidus Temp"] = splice["PROP ST (K)"] #+ np.random.normal(0, 100, size=splice.shape[0])
-    df["Melting Temp (ST Prior)"] =  splice['Tm Avg'] #splice['Tm Avg']
-
-    # ---- Phase/BCC fields ----
+    # BCC phase fraction at 600C -> truth flag: 5 (single-phase), else -5
     cols_600_bcc = [c for c in splice.columns if ("600C" in c and "BCC" in c)]
     df["600C BCC Total"] = splice[cols_600_bcc].sum(axis=1)
     df["600C BCC Total"] = np.where(df["600C BCC Total"] > 0.99, 5.0, -5.0)
 
-    #VEC prior → latent ±5 with threshold 6.87 (use 'VEC' then fallback to 'VEC Avg')
-    vec_col = "VEC" if "VEC" in splice.columns else ("VEC Avg" if "VEC Avg" in splice.columns else None)
-    if vec_col is None:
-        raise ValueError("Neither 'VEC' nor 'VEC Avg' found in splice columns.")
-    df["VEC (BCC Prior)"] = np.where(splice[vec_col] >= VEC_THRESHOLD, 1.0, -1.0)
-
-    # ---- Elemental fractions 
+    # BCC prior: default 50/50 → logit(0.5) = 0.0 everywhere
+    df["VEC (BCC Prior)"] = 0.0
+    
     missing_cols = [c for c in ELEM_COLS if c not in splice.columns]
     if missing_cols:
         raise ValueError(f"Missing elemental columns: {missing_cols}")
 
     df = df.merge(splice[ELEM_COLS], left_index=True, right_index=True)
 
-    # Tidy
+
+    # Clean NA and reset index
     df = df.dropna().reset_index(drop=True)
-
-    # Ensure element columns present and numeric
-    missing = [c for c in ELEM_COLS if c not in df.columns]
-    if missing:
-        raise ValueError(f"Missing elemental columns: {missing}")
-    for c in ELEM_COLS:
-        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
-
     return df
 
 def current_observed_objectives(df_train_measured: pd.DataFrame) -> np.ndarray:
+    """(K,4) measured objective matrix in maximize space."""
     if df_train_measured.shape[0] == 0:
         return np.zeros((0, 4), dtype=float)
     return np.column_stack([
@@ -367,11 +429,12 @@ def current_observed_objectives(df_train_measured: pd.DataFrame) -> np.ndarray:
 def gp_predict_all(models: Models, X: np.ndarray, df_rows: pd.DataFrame
                    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
-    Return:
-      means:  [mu_ST, -mu_Density, mu_YS, mu_Pugh] in maximize space
-      sigmas: [sd_ST_res, sd_Density_res, sd_YS_res, sd_Pugh]
-      mu_bcc_logit: latent for BCC GP + VEC prior
-      sd_bcc: std for BCC GP
+    Predict means/stds for objectives + BCC on X matching df rows.
+    Returns:
+      means:  (N, 4) [ST, -Density, YS, Pugh]  (NOT shifted)
+      sigmas: (N, 4) std devs (residual for prior-based ones)
+      mu_bcc_logit: (N,) predicted BCC logit (residual + prior=0)
+      sd_bcc: (N,) predicted std dev of BCC residual
     """
     mu_den_res, sd_den_res = models.density.predict(X, return_std=True)
     mu_den = mu_den_res + df_rows["Density Prior"].to_numpy(float)
@@ -392,10 +455,51 @@ def gp_predict_all(models: Models, X: np.ndarray, df_rows: pd.DataFrame
     sigmas = np.maximum(sigmas, EPS)
     return means, sigmas, mu_bcc_logit, sd_bcc
 
-def select_next_by_acq(acq_full: np.ndarray, df: pd.DataFrame, df_pool: pd.DataFrame) -> int:
+def select_next_via_ehvi(
+    acq_full: np.ndarray,
+    df: pd.DataFrame,
+    df_pool: pd.DataFrame,
+) -> int:
+    """Select argmax of acquisition over pool labels."""
     pool_labels = df_pool.index.to_numpy()
     best_rel = int(np.argmax(acq_full[pool_labels]))
     return int(pool_labels[best_rel])
+
+# =================== pEHVI implementation ===================
+
+def pEHVI_max_all_candidates(
+    means: np.ndarray,
+    sigmas: np.ndarray,
+    ref: np.ndarray,
+    pareto: np.ndarray
+) -> np.ndarray:
+    """
+    Compute pointwise Expected Hypervolume Improvement (pEHVI) for all candidates
+    in a vectorized manner. Inputs are in maximize-space, shifted by REF_POINT, and
+    scaled by per-dimension 'ranges' (divide by smax - smin of the current iteration).
+    """
+    N, D = means.shape
+    sig = np.maximum(sigmas, EPS)
+
+    # Box (unconditional EI) from ref to each mean
+    s_up = (means - ref) / sig
+    up = (means - ref) * norm.cdf(s_up) + sig * norm.pdf(s_up)
+    box = np.prod(up, axis=1)
+
+    if pareto.size == 0:
+        return np.maximum(box, 0.0)
+
+    P = pareto.reshape(-1, D)
+    pehvi = np.full(N, np.inf, dtype=float)
+    for k in range(P.shape[0]):
+        p = P[k]
+        s_low = (means - p) / sig
+        low = (means - p) * norm.cdf(s_low) + sig * norm.pdf(s_low)
+        diff = np.maximum(up - low, 0.0)
+        dominated_single = np.prod(diff, axis=1)
+        ehvi_k = box - dominated_single
+        pehvi = np.minimum(pehvi, ehvi_k)
+    return np.maximum(pehvi, 0.0)
 
 # =================== Main loop ===================
 
@@ -404,11 +508,10 @@ def run_campaign(seed: int = 0, iterations: int = 100) -> None:
 
     np.random.seed(seed)
     os.makedirs(RESULTS_DIR, exist_ok=True)
-    os.makedirs(PLOTS_DIR, exist_ok=True)
 
     print(f"Running campaign seed={seed}")
- 
-        # Load and prep
+
+    # Load and prep
     splice = load_design_space()
     scaled_space = float(splice["PROP 25C Density (g/cm3)"].max(skipna=True)) <= 1.5
     global DENSITY_THRESH, YS_THRESH, PUGH_THRESH, ST_THRESH, VEC_THRESHOLD
@@ -425,7 +528,17 @@ def run_campaign(seed: int = 0, iterations: int = 100) -> None:
         ST_THRESH = DEFAULT_ST_THRESH if ST_THRESH is None else ST_THRESH
         VEC_THRESHOLD = DEFAULT_VEC_THRESHOLD if VEC_THRESHOLD is None else VEC_THRESHOLD
     df = prepare_dataframe(splice)
+    global PARETO_BCC_MASK
+    PARETO_BCC_MASK = _compute_pareto_bcc_mask(df)
+    feasible_mask = (
+        (df["Density"].to_numpy(float) < DENSITY_THRESH) &
+        (df["YS 600C"].to_numpy(float) > YS_THRESH) &
+        (df["Pugh Ratio"].to_numpy(float) > PUGH_THRESH) &
+        (df["Solidus Temp"].to_numpy(float) > ST_THRESH) &
+        (df["600C BCC Total"].to_numpy(float) == BCC_SINGLE_VALUE)
+    )
 
+    # Ground-truth labels INCLUDING BCC requirement
     truth_pass = (
         (df["Density"] < DENSITY_THRESH) &
         (df["YS 600C"] > YS_THRESH) &
@@ -433,43 +546,52 @@ def run_campaign(seed: int = 0, iterations: int = 100) -> None:
         (df["Solidus Temp"] > ST_THRESH) &
         (df["600C BCC Total"] == BCC_SINGLE_VALUE)
     ).astype(int).to_numpy()
-    # indices of TRUE-feasible alloys (all constraints incl. BCC)
-    true_idx_all_wbcc = np.flatnonzero(truth_pass == 1).tolist()
-    num_true_feasible = len(true_idx_all_wbcc)
-    total_points = int(df.shape[0])
 
-    # ---- Print the requested counts ----
-    print(f"[Data] Total points: {total_points}")
-    print(f"[Data] True feasible (all constraints incl. BCC): {num_true_feasible}")
+    # Accessible universe
+    bcc_mask_all = (df["600C BCC Total"].to_numpy() == BCC_SINGLE_VALUE)
+    if not np.any(bcc_mask_all):
+        raise RuntimeError("No single-phase BCC alloys available to seed the campaign.")
 
-    # Compute fixed (non-changing) ranges ONCE from dataset min/max in maximize space
+    # All points in maximize-space
     all_points_max = np.column_stack([
         df["Solidus Temp"].to_numpy(float),
         -df["Density"].to_numpy(float),
         df["YS 600C"].to_numpy(float),
         df["Pugh Ratio"].to_numpy(float),
     ])
-    shifted = all_points_max - REF_POINT
-    smin_fix = np.min(shifted, axis=0)
-    smax_fix = np.max(shifted, axis=0)
+
+    # --------- FIXED (non-changing) ranges from dataset min/max ----------
+    if FIXED_RANGE_SCOPE == "BCC_ONLY":
+        pts_for_range = all_points_max[bcc_mask_all]
+    else:
+        pts_for_range = all_points_max
+
+    shifted_for_range = pts_for_range - REF_POINT
+    smin_fix = np.min(shifted_for_range, axis=0)
+    smax_fix = np.max(shifted_for_range, axis=0)
     FIXED_RANGES = np.maximum(smax_fix - smin_fix, EPS)
-    print("[Fixed ranges] ST, -Den, YS, Pugh =", FIXED_RANGES.tolist())
 
-    bcc_mask = (df["600C BCC Total"].to_numpy() == BCC_SINGLE_VALUE)
-    if not np.any(bcc_mask):
-        raise RuntimeError("No single-phase BCC alloys available to seed the campaign.")
-    initial_idx = np.random.choice(np.where(bcc_mask)[0], 1, replace=False)
+    print("[Fixed ranges] scope=", FIXED_RANGE_SCOPE, " | values=", FIXED_RANGES.tolist())
 
+    # Seed initial measured set from BCC-single
+    #initial_idx = np.random.choice(np.where(bcc_mask_all)[0], 10, replace=False)
+    initial_idx = np.random.choice(np.where(bcc_mask_all)[0], 1, replace=False)
+
+    # Columns
     obj_train_cols = ELEM_COLS + [
         "Density", "Density Prior", "YS 600C", "YS Prior", "Pugh Ratio",
         "600C BCC Total", "Solidus Temp", "Melting Temp (ST Prior)", "VEC (BCC Prior)"
     ]
     phase_train_cols = ELEM_COLS + ["600C BCC Total", "VEC (BCC Prior)"]
 
+    # Two training tables:
     df_train_measured = df.loc[initial_idx, obj_train_cols].copy().reset_index(drop=True)
     df_train_phase = df.loc[initial_idx, phase_train_cols].copy().reset_index(drop=True)
+
+    # Pool keeps labels
     df_pool = df.drop(index=initial_idx)
 
+    # Models
     models = build_models(seed)
 
     # Bookkeeping
@@ -478,14 +600,10 @@ def run_campaign(seed: int = 0, iterations: int = 100) -> None:
     t0 = time.time()
     hv_raw_prev = 0.0
 
-    measured_indices = set(initial_idx.tolist())
-    unmeasurable_indices = set()
-    t0 = time.time()
-
     for it in range(iterations):
         it0 = time.time()
 
-        # --- Train OBJECTIVE GPs (measured only) ---
+        # --- Train OBJECTIVE GPs on measured data only ---
         X_train_obj = df_train_measured[ELEM_COLS].to_numpy(float)
 
         y_den_res = df_train_measured["Density"].to_numpy(float) - df_train_measured["Density Prior"].to_numpy(float)
@@ -498,7 +616,7 @@ def run_campaign(seed: int = 0, iterations: int = 100) -> None:
         models.pugh.fit(X_train_obj, y_pugh)
         models.st.fit(X_train_obj, y_st_res)
 
-        # --- Train PHASE GP (all observed phase labels) ---
+        # --- Train PHASE GP on ALL observed phase labels ---
         X_train_phase = df_train_phase[ELEM_COLS].to_numpy(float)
         y_bcc_res = df_train_phase["600C BCC Total"].to_numpy(float)  # ±5 regression label
         models.bcc.fit(X_train_phase, y_bcc_res)
@@ -506,12 +624,12 @@ def run_campaign(seed: int = 0, iterations: int = 100) -> None:
         # --- Predictions over full design space ---
         X_full = df[ELEM_COLS].to_numpy(float)
         means_full, sigmas_full, mu_bcc_logit, sd_bcc = gp_predict_all(models, X_full, df)  # [ST, -DEN, YS, Pugh]
-        p_bcc = sigmoid(mu_bcc_logit)
+        p_bcc = sigmoid(mu_bcc_logit)  # (N,)
         df["p_bcc"] = np.clip(p_bcc, 0.0, 1.0)
 
-        # Expose means/stds (also back-transform density mean)
+        # ===== Expose GP prediction means (for plotting/logging) =====
         mu_st  = means_full[:, 0]
-        mu_den = -(means_full[:, 1])
+        mu_den = -(means_full[:, 1])         # convert back to +Density
         mu_ys  = means_full[:, 2]
         mu_pug = means_full[:, 3]
 
@@ -531,28 +649,44 @@ def run_campaign(seed: int = 0, iterations: int = 100) -> None:
         df["sd_Pugh"]      = sd_pug
         df["sd_BCC"]       = sd_bcc
 
-        # ---------- Feasibility probabilities ----------
-        p_den  = norm.cdf((DENSITY_THRESH - mu_den) / sd_den)         # P(Density < thresh)
-        p_ys   = 1.0 - norm.cdf((YS_THRESH   - mu_ys)  / sd_ys)       # P(YS > thresh)
-        p_pugh = 1.0 - norm.cdf((PUGH_THRESH - mu_pug) / sd_pug)      # P(Pugh > thresh)
-        p_st   = 1.0 - norm.cdf((ST_THRESH   - mu_st)  / sd_st)       # P(ST > thresh)
-        df["p_Density"] = np.clip(p_den, 0.0, 1.0)
-        df["p_YS"]      = np.clip(p_ys, 0.0 , 1.0)
-        df["p_Pugh"]    = np.clip(p_pugh, 0.0   , 1.0)
-        df["p_ST"]      = np.clip(p_st, 0.0 , 1.0)
+        # ---------- pEHVI (per-iteration scaling in shifted space) ----------
+        shifted_full = means_full - REF_POINT                         # (N,4)
+        pareto_obs_before = current_observed_objectives(df_train_measured)   # (K,4)
+        shifted_pareto_before = pareto_obs_before - REF_POINT
 
-        total_prob_no_bcc   = np.clip(p_den * p_ys * p_pugh * p_st, 0.0, 1.0)
+        smin = np.min(shifted_full, axis=0)
+        smax = np.max(shifted_full, axis=0)
+        ranges_dyn = np.maximum(smax - smin, EPS)
+
+        shifted_full_scaled = shifted_full / ranges_dyn
+        sigmas_scaled = sigmas_full / ranges_dyn
+        shifted_pareto_scaled = shifted_pareto_before / ranges_dyn
+
+        ref_min = np.zeros((1, shifted_full_scaled.shape[1]), dtype=float)
+        pehvi_full = pEHVI_max_all_candidates(
+            means=shifted_full_scaled,
+            sigmas=sigmas_scaled,
+            ref=ref_min,
+            pareto=shifted_pareto_scaled,
+        )
+
+        # --------- Predicted feasibility ----------
+        p_den = norm.cdf((DENSITY_THRESH - mu_den) / sd_den)
+        p_ys  = 1.0 - norm.cdf((YS_THRESH - mu_ys) / sd_ys)
+        p_pugh = 1.0 - norm.cdf((PUGH_THRESH - mu_pug) / sd_pug)
+        p_st = 1.0 - norm.cdf((ST_THRESH - mu_st) / sd_st)
+
+        total_prob_no_bcc = np.clip(p_den * p_ys * p_pugh * p_st, 0.0, 1.0)
         total_prob_with_bcc = np.clip(total_prob_no_bcc * df["p_bcc"].to_numpy(), 0.0, 1.0)
-        df["Prob_All_NoBCC"] = total_prob_no_bcc
         df["Total_Prob_With_BCC"] = total_prob_with_bcc
 
-        # --------- Acquisition (feasibility-first) ----------
-        acq_full = total_prob_with_bcc
+        # --------- Acquisition = EHVI * POF (all constraints incl. BCC) ----------
+        acq_full = np.maximum(pehvi_full, 0.0) * total_prob_with_bcc
         df["Acq"] = acq_full
         df["AcqNorm"] = acq_full
-        df["AcqPlotVal"] = acq_full
+        df["AcqPlotVal"] = df["AcqNorm"]
 
-        # Predicted labels (for metrics): require >0.5 & p_bcc>0.5
+
         pred_labels_full = ((total_prob_no_bcc > 0.5) & (df["p_bcc"].to_numpy() > 0.5)).astype(int)
 
         # ---- Measured-set tallies + current Pareto count (BEFORE pick) ----
@@ -587,7 +721,7 @@ def run_campaign(seed: int = 0, iterations: int = 100) -> None:
         hv_raw_before = hypervolume_exact(pareto_obs_before, REF_POINT)
 
         # ---------- Select next via acquisition ----------
-        next_idx = select_next_by_acq(acq_full, df, df_pool)
+        next_idx = select_next_via_ehvi(acq_full, df, df_pool)
 
         # ---------- Observe phase; conditionally observe objectives ----------
         true_is_bcc_single = (float(df.loc[next_idx, "600C BCC Total"]) == BCC_SINGLE_VALUE)
@@ -700,15 +834,29 @@ def run_campaign(seed: int = 0, iterations: int = 100) -> None:
         else:
             pd.DataFrame([row]).to_csv(run_path, index=False)
 
+        it_dt = time.time() - it0
+        status_str = "MEASURED objectives" if measured_flag else "PHASE-ONLY (non-BCC)"
+        print(f"[Seed {seed}, Iter {it:03d}] idx={next_idx} | {status_str} | "
+              f"Pareto?={'Yes' if chosen_is_pareto_measured else 'No'} | "
+              f"acq={acq_full[next_idx]:.3e} | HV_fixed(before)={hv_raw_before:.3e} | "
+              f"pool={df_pool.shape[0]} | {it_dt:.2f}s")
+
         plot_affine_simplex_progress(
             df=df,
             measured_indices=measured_indices,
             total_prob_with_bcc=total_prob_with_bcc,
             iteration=it,
             last_idx=next_idx if measured_flag else None,
+            pareto_mask=PARETO_BCC_MASK,
+            feasible_mask=feasible_mask,
         )
 
-# =================== Optional: run multiple seeds in parallel ===================
+        if df_pool.empty:
+            print("Pool exhausted, stopping.")
+            break
+
+    print(f"Total wall time: {time.time() - t0:.2f}s")
+
 
 def _run_seed(seed: int, iterations: int = 100) -> int:
     """
@@ -716,14 +864,17 @@ def _run_seed(seed: int, iterations: int = 100) -> int:
     - Limits BLAS/OpenMP threads to 1 per process (prevents CPU oversubscription).
     - Puts plots for this seed into a unique subfolder and prefixes filenames with the seed.
     """
+    # prevent thread oversubscription in each process
     os.environ.setdefault("OMP_NUM_THREADS", "1")
     os.environ.setdefault("MKL_NUM_THREADS", "1")
     os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
     os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 
+    # make per-seed plotting directory & prefixes
     seed_plot_dir = os.path.join(PLOTS_BASE_DIR, f"seed_{seed:03d}")
     os.makedirs(seed_plot_dir, exist_ok=True)
 
+    # Override globals (each process has its own copy)
     g = globals()
     if "PLOTS_DIR" in g:
         g["PLOTS_DIR"] = seed_plot_dir
@@ -731,14 +882,17 @@ def _run_seed(seed: int, iterations: int = 100) -> int:
         g["PLOT_PREFIX"] = f"affine_progress_s{seed:03d}"
     if "PRED_PLOT_PREFIX" in g:
         g["PRED_PLOT_PREFIX"] = f"affine_pred_s{seed:03d}"
+
+    # ensure results dir exists
     if "RESULTS_DIR" in g:
         os.makedirs(g["RESULTS_DIR"], exist_ok=True)
 
+    # run the campaign
     run_campaign(seed=seed, iterations=iterations)
     return seed
 
-def _parse_seed_list(spec: str) -> List[int]:
-    seeds: List[int] = []
+def _parse_seed_list(spec: str) -> list[int]:
+    seeds: list[int] = []
     for part in spec.split(","):
         part = part.strip()
         if not part:
@@ -754,7 +908,7 @@ def _parse_seed_list(spec: str) -> List[int]:
     return seeds
 
 def _configure_from_args(args: argparse.Namespace) -> tuple[list[int], int, int]:
-    global RESULTS_DIR, PLOTS_BASE_DIR, DATA_PATH
+    global RESULTS_DIR, PLOTS_BASE_DIR, DATA_PATH, FIXED_RANGE_SCOPE
     global DENSITY_THRESH, YS_THRESH, PUGH_THRESH, ST_THRESH, VEC_THRESHOLD
     global PLOT_AFFINE, PLOT_EVERY
     global RUN_NAME
@@ -765,16 +919,18 @@ def _configure_from_args(args: argparse.Namespace) -> tuple[list[int], int, int]
         PLOTS_BASE_DIR = args.plots_dir
     if args.data_path:
         DATA_PATH = args.data_path
+    if args.fixed_range_scope:
+        FIXED_RANGE_SCOPE = args.fixed_range_scope
+    if args.plot_affine:
+        PLOT_AFFINE = True
+    if args.plot_every:
+        PLOT_EVERY = args.plot_every
 
     DENSITY_THRESH = args.density_thresh
     YS_THRESH = args.ys_thresh
     PUGH_THRESH = args.pugh_thresh
     ST_THRESH = args.st_thresh
     VEC_THRESHOLD = args.vec_thresh
-    if args.plot_affine:
-        PLOT_AFFINE = True
-    if args.plot_every:
-        PLOT_EVERY = args.plot_every
 
     default_seeds = list(range(1, 200 + 1))
     seeds = _parse_seed_list(args.seeds) if args.seeds else default_seeds
@@ -793,7 +949,7 @@ def _configure_from_args(args: argparse.Namespace) -> tuple[list[int], int, int]
 
 def _build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="Constraint-satisfaction campaign with priors (feasibility-first)."
+        description="Constraint-satisfaction campaign with pEHVI (optimisation-first)."
     )
     p.add_argument("--seeds", help="Comma list or ranges, e.g. 1,2,5-8")
     p.add_argument("--iterations", type=int, help="Iterations per seed")
@@ -806,6 +962,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--pugh-thresh", type=float, help="Pugh ratio threshold")
     p.add_argument("--st-thresh", type=float, help="Solidus temperature threshold")
     p.add_argument("--vec-thresh", type=float, help="VEC threshold for BCC prior")
+    p.add_argument(
+        "--fixed-range-scope",
+        choices=["ALL", "BCC_ONLY"],
+        default="ALL",
+        help="Scope for fixed-range HV scaling (ALL or BCC_ONLY).",
+    )
     p.add_argument("--plot-affine", action="store_true", help="Enable affine simplex progress plots")
     p.add_argument("--plot-every", type=int, default=1, help="Plot every N iterations")
     return p
@@ -817,11 +979,13 @@ def main() -> None:
 
     print(f"[main] Launching {len(seeds)} seeds with {workers} workers...")
 
+    # also apply thread caps to children by setting in parent (belt & suspenders)
     os.environ.setdefault("OMP_NUM_THREADS", "1")
     os.environ.setdefault("MKL_NUM_THREADS", "1")
     os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
     os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 
+    # run in parallel
     with ProcessPoolExecutor(max_workers=workers) as ex:
         futures = [ex.submit(_run_seed, s, iterations) for s in seeds]
         for fut in as_completed(futures):

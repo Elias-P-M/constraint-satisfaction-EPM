@@ -30,6 +30,7 @@ import os
 import json
 import time
 import argparse
+import datetime
 from dataclasses import dataclass
 from typing import Tuple, Iterable, Optional
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -64,7 +65,10 @@ RESULTS_DIR = "results_opt"
 PLOTS_DIR = "results_opt"
 PLOT_PREFIX = "affine_progress_opt"
 PRED_PLOT_PREFIX = "affine_pred_opt"
-PLOTS_BASE_DIR = "."
+PLOTS_BASE_DIR = "plots_opt"
+PLOT_AFFINE = False
+PLOT_EVERY = 1
+PARETO_BCC_MASK: Optional[np.ndarray] = None
 
 # Feasibility thresholds (defaults; overridden per dataset or CLI)
 DEFAULT_ST_THRESH = 2200 + 273
@@ -102,6 +106,7 @@ FIXED_RANGES = None           # np.ndarray shape (4,)
 
 DATA_CANDIDATES = ("design_space.xlsx", "design_space.csv")
 DATA_PATH: Optional[str] = None
+RUN_NAME: Optional[str] = None
 
 
 def load_design_space(path: Optional[str] = None) -> pd.DataFrame:
@@ -121,6 +126,17 @@ def load_design_space(path: Optional[str] = None) -> pd.DataFrame:
     raise FileNotFoundError(
         "Expected design_space.xlsx or design_space.csv in this directory."
     )
+
+def infer_scaled_space(path: Optional[str] = None) -> bool:
+    df = load_design_space(path)
+    return float(df["PROP 25C Density (g/cm3)"].max(skipna=True)) <= 1.5
+
+def build_run_name(seeds: list[int], iterations: int, data_tag: str) -> str:
+    date_str = datetime.date.today().isoformat()
+    method = "opt"
+    prior_tag = "-noprior"
+    acq = "pehvi"
+    return f"{date_str}_{method}{prior_tag}_{acq}_{data_tag}_{len(seeds)}x{iterations}"
 
 # =================== Hypervolume (EXACT; NOT EHVI) ===================
 
@@ -210,6 +226,138 @@ class Models:
 def ensure_dir(path: str) -> None:
     if path and not os.path.exists(path):
         os.makemks(path, exist_ok=True)
+
+def _polygon_vertices(n: int) -> np.ndarray:
+    """Regular n-gon vertices on the unit circle."""
+    angles = np.linspace(0, 2 * np.pi, n, endpoint=False)
+    return np.column_stack([np.cos(angles), np.sin(angles)])
+
+def _simplex_project_2d(weights: np.ndarray) -> np.ndarray:
+    """Project element-fraction weights onto a 2D regular n-gon."""
+    n = weights.shape[1]
+    verts = _polygon_vertices(n)
+    return weights @ verts
+
+def _compute_pareto_bcc_mask(df: pd.DataFrame) -> np.ndarray:
+    """Compute ground-truth Pareto mask restricted to BCC single-phase points."""
+    bcc_cols = [c for c in df.columns if ("600C" in c and "BCC" in c)]
+    if not bcc_cols:
+        return np.zeros(len(df), dtype=bool)
+    bcc_single = (df[bcc_cols].sum(axis=1) > 0.99).to_numpy()
+    obj = np.column_stack([
+        df["Solidus Temp"].to_numpy(float),
+        -df["Density"].to_numpy(float),
+        df["YS 600C"].to_numpy(float),
+        df["Pugh Ratio"].to_numpy(float),
+    ])
+    idx = np.where(bcc_single)[0]
+    P = obj[idx]
+    order = np.argsort(-P[:, 0])
+    P_sorted = P[order]
+    idx_sorted = idx[order]
+
+    front: list[int] = []
+    front_objs = np.empty((0, P.shape[1]), dtype=float)
+    for i, p in enumerate(P_sorted):
+        if front_objs.size:
+            ge = np.all(front_objs >= p, axis=1)
+            gt = np.any(front_objs > p, axis=1)
+            if np.any(ge & gt):
+                continue
+            le = np.all(p >= front_objs, axis=1)
+            lt = np.any(p > front_objs, axis=1)
+            keep = ~(le & lt)
+            if not np.all(keep):
+                front_objs = front_objs[keep]
+                front = [f for k, f in zip(keep.tolist(), front) if k]
+        front.append(int(idx_sorted[i]))
+        front_objs = np.vstack([front_objs, p])
+
+    pareto_mask = np.zeros(len(df), dtype=bool)
+    pareto_mask[np.array(front, dtype=int)] = True
+    return pareto_mask
+
+def plot_affine_simplex_progress(
+    df: pd.DataFrame,
+    measured_indices: set[int],
+    total_prob_with_bcc: np.ndarray,
+    iteration: int,
+    last_idx: Optional[int] = None,
+    pareto_mask: Optional[np.ndarray] = None,
+    feasible_mask: Optional[np.ndarray] = None,
+) -> None:
+    if not PLOT_AFFINE or (iteration % PLOT_EVERY != 0):
+        return
+    elem = df[ELEM_COLS].to_numpy(float)
+    elem = np.clip(elem, 0.0, None)
+    sums = elem.sum(axis=1)
+    mask = sums > 0
+    if not np.any(mask):
+        return
+    weights = elem[mask] / sums[mask][:, None]
+    coords = _simplex_project_2d(weights)
+    colors = total_prob_with_bcc[mask]
+
+    order = np.argsort(colors)
+    coords = coords[order]
+    colors = colors[order]
+    ordered_idx = np.where(mask)[0][order]
+
+    fig, ax = plt.subplots(figsize=(6, 5))
+    sc = ax.scatter(coords[:, 0], coords[:, 1], c=colors, cmap="viridis", s=10, alpha=0.5)
+    if measured_indices:
+        meas = np.array(sorted(measured_indices), dtype=int)
+        meas = meas[(meas >= 0) & (meas < mask.shape[0])]
+        meas = meas[mask[meas]]
+        if meas.size > 0:
+            meas_idx = np.where(np.isin(ordered_idx, meas))[0]
+            ax.scatter(coords[meas_idx, 0], coords[meas_idx, 1],
+                       s=30, facecolors="none", edgecolors="white", linewidths=0.8, alpha=0.9, zorder=3)
+    if last_idx is not None and last_idx in np.where(mask)[0]:
+        last_pos = np.where(ordered_idx == last_idx)[0][0]
+        ax.scatter(coords[last_pos, 0], coords[last_pos, 1],
+                   s=80, facecolors="none", edgecolors="red", linewidths=1.5, zorder=6)
+
+    if pareto_mask is not None and measured_indices:
+        pareto_idx = np.where(pareto_mask)[0]
+        mp = np.array(sorted(measured_indices), dtype=int)
+        mp = mp[np.isin(mp, pareto_idx)]
+        if mp.size > 0:
+            mp_idx = np.where(np.isin(ordered_idx, mp))[0]
+            ax.scatter(coords[mp_idx, 0], coords[mp_idx, 1],
+                       s=80, marker="*", facecolors="blue", edgecolors="blue",
+                       linewidths=0.6, alpha=0.95, zorder=5, label="Queried Pareto (BCC)")
+
+    if feasible_mask is not None and measured_indices:
+        feasible_idx = np.where(feasible_mask)[0]
+        mf = np.array(sorted(measured_indices), dtype=int)
+        mf = mf[np.isin(mf, feasible_idx)]
+        if mf.size > 0:
+            mf_idx = np.where(np.isin(ordered_idx, mf))[0]
+            ax.scatter(coords[mf_idx, 0], coords[mf_idx, 1],
+                       s=110, marker="*", facecolors="red", edgecolors="red",
+                       linewidths=0.6, alpha=0.95, zorder=6, label="Queried Feasible (All constraints)")
+
+    verts = _polygon_vertices(len(ELEM_COLS))
+    ax.plot(np.append(verts[:, 0], verts[0, 0]), np.append(verts[:, 1], verts[0, 1]), color="black", lw=1.0)
+    for i, (x, y) in enumerate(verts):
+        ax.text(x * 1.08, y * 1.08, ELEM_COLS[i], ha="center", va="center", fontsize=8)
+
+    ax.set_title(f"Affine Simplex Progress (iter {iteration:03d})")
+    ax.set_xlabel("Simplex X")
+    ax.set_ylabel("Simplex Y")
+    ax.set_aspect("equal", "box")
+    ax.set_xlim(-1.15, 1.15)
+    ax.set_ylim(-1.15, 1.15)
+    ax.set_axis_off()
+    ax.legend(frameon=False, loc="lower right")
+    fig.colorbar(sc, ax=ax, shrink=0.75, pad=0.02, label="Pred_Prob_With_BCC")
+    fig.tight_layout()
+
+    os.makedirs(PLOTS_DIR, exist_ok=True)
+    out_path = os.path.join(PLOTS_DIR, f"{PLOT_PREFIX}_iter{iteration:03d}.png")
+    fig.savefig(out_path, dpi=200)
+    plt.close(fig)
 
 def build_models(seed: int) -> Models:
     base_kernel = RBF(length_scale=[1.0] * len(ELEM_COLS),
@@ -380,6 +528,15 @@ def run_campaign(seed: int = 0, iterations: int = 100) -> None:
         ST_THRESH = DEFAULT_ST_THRESH if ST_THRESH is None else ST_THRESH
         VEC_THRESHOLD = DEFAULT_VEC_THRESHOLD if VEC_THRESHOLD is None else VEC_THRESHOLD
     df = prepare_dataframe(splice)
+    global PARETO_BCC_MASK
+    PARETO_BCC_MASK = _compute_pareto_bcc_mask(df)
+    feasible_mask = (
+        (df["Density"].to_numpy(float) < DENSITY_THRESH) &
+        (df["YS 600C"].to_numpy(float) > YS_THRESH) &
+        (df["Pugh Ratio"].to_numpy(float) > PUGH_THRESH) &
+        (df["Solidus Temp"].to_numpy(float) > ST_THRESH) &
+        (df["600C BCC Total"].to_numpy(float) == BCC_SINGLE_VALUE)
+    )
 
     # Ground-truth labels INCLUDING BCC requirement
     truth_pass = (
@@ -684,6 +841,16 @@ def run_campaign(seed: int = 0, iterations: int = 100) -> None:
               f"acq={acq_full[next_idx]:.3e} | HV_fixed(before)={hv_raw_before:.3e} | "
               f"pool={df_pool.shape[0]} | {it_dt:.2f}s")
 
+        plot_affine_simplex_progress(
+            df=df,
+            measured_indices=measured_indices,
+            total_prob_with_bcc=total_prob_with_bcc,
+            iteration=it,
+            last_idx=next_idx if measured_flag else None,
+            pareto_mask=PARETO_BCC_MASK,
+            feasible_mask=feasible_mask,
+        )
+
         if df_pool.empty:
             print("Pool exhausted, stopping.")
             break
@@ -704,7 +871,7 @@ def _run_seed(seed: int, iterations: int = 100) -> int:
     os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 
     # make per-seed plotting directory & prefixes
-    seed_plot_dir = os.path.join(PLOTS_BASE_DIR, f"plots_seed_{seed:03d}")
+    seed_plot_dir = os.path.join(PLOTS_BASE_DIR, f"seed_{seed:03d}")
     os.makedirs(seed_plot_dir, exist_ok=True)
 
     # Override globals (each process has its own copy)
@@ -743,6 +910,8 @@ def _parse_seed_list(spec: str) -> list[int]:
 def _configure_from_args(args: argparse.Namespace) -> tuple[list[int], int, int]:
     global RESULTS_DIR, PLOTS_BASE_DIR, DATA_PATH, FIXED_RANGE_SCOPE
     global DENSITY_THRESH, YS_THRESH, PUGH_THRESH, ST_THRESH, VEC_THRESHOLD
+    global PLOT_AFFINE, PLOT_EVERY
+    global RUN_NAME
 
     if args.results_dir:
         RESULTS_DIR = args.results_dir
@@ -752,6 +921,10 @@ def _configure_from_args(args: argparse.Namespace) -> tuple[list[int], int, int]
         DATA_PATH = args.data_path
     if args.fixed_range_scope:
         FIXED_RANGE_SCOPE = args.fixed_range_scope
+    if args.plot_affine:
+        PLOT_AFFINE = True
+    if args.plot_every:
+        PLOT_EVERY = args.plot_every
 
     DENSITY_THRESH = args.density_thresh
     YS_THRESH = args.ys_thresh
@@ -763,6 +936,15 @@ def _configure_from_args(args: argparse.Namespace) -> tuple[list[int], int, int]
     seeds = _parse_seed_list(args.seeds) if args.seeds else default_seeds
     iterations = args.iterations if args.iterations is not None else 100
     workers = args.workers if args.workers is not None else 25
+
+    if args.results_dir is None or args.plots_dir is None:
+        data_tag = "scaled" if infer_scaled_space(args.data_path) else "raw"
+        RUN_NAME = build_run_name(seeds, iterations, data_tag)
+        if args.results_dir is None:
+            RESULTS_DIR = f"results_{RUN_NAME}"
+        if args.plots_dir is None:
+            PLOTS_BASE_DIR = f"plots_{RUN_NAME}"
+
     return seeds, iterations, workers
 
 def _build_arg_parser() -> argparse.ArgumentParser:
@@ -786,6 +968,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default="ALL",
         help="Scope for fixed-range HV scaling (ALL or BCC_ONLY).",
     )
+    p.add_argument("--plot-affine", action="store_true", help="Enable affine simplex progress plots")
+    p.add_argument("--plot-every", type=int, default=1, help="Plot every N iterations")
     return p
 
 def main() -> None:
@@ -807,6 +991,7 @@ def main() -> None:
         for fut in as_completed(futures):
             s = fut.result()
             print(f"[main] seed {s} finished.")
+    print(f"[main] Completed {len(seeds)} seeds.")
     print("[main] All seeds done.")
 
 if __name__ == "__main__":

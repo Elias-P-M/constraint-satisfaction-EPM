@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Feasibility-first active learning (constraints-first) with priors enabled.
+Random acquisition campaign (uniform selection without replacement).
 
-- Acquisition: acq_full = Total_Prob_With_BCC
+- Acquisition: uniform random choice from the pool (no replacement).
 - Logs fixed-range scaled HV (AFTER pick) to keep apples-to-apples with MOBO.
 - Flags if the chosen point is Pareto on the measured set after adding it.
 - Plots:
@@ -10,12 +10,7 @@ Feasibility-first active learning (constraints-first) with priors enabled.
   * Per-objective prediction maps each iter (ST, Density, YS, Pugh, p_BCC)
   * TRUE feasible alloys overlaid as WHITE CROSSES on top
 
-Priors (enabled as requested):
-- YS Prior         = splice['YS 25C PRIOR'] + N(0, 50)
-- Density Prior    = splice['Density Avg'] + N(0, 0.5)
-- ST Prior (Tm)    = splice['Tm Avg']
-- VEC (BCC Prior)  = ±5 with threshold 6.87 (uses 'VEC' or 'VEC Avg' if present)
-- 600C BCC Total   = ±5 (sum of 600C BCC cols > 0.99 ⇒ +5, else -5)
+Priors: disabled (residuals around zero).
 """
 
 from __future__ import annotations
@@ -54,11 +49,11 @@ warnings.filterwarnings("ignore", category=OptimizeWarning)
 
 # =================== CONFIG / CONSTANTS ===================
 
-RESULTS_DIR = "results_const_no_prior"
-PLOTS_DIR = "results_const_no_prior"           # overridden per-seed by _run_seed
-PLOT_PREFIX = "affine_progress_no_prior"       # overridden per-seed by _run_seed
-PRED_PLOT_PREFIX = "affine_pred_no_prior"      # overridden per-seed by _run_seed
-PLOTS_BASE_DIR = "plots_const_no_prior"
+RESULTS_DIR = "results_random"
+PLOTS_DIR = "results_random"           # overridden per-seed by _run_seed
+PLOT_PREFIX = "affine_progress_random"       # overridden per-seed by _run_seed
+PRED_PLOT_PREFIX = "affine_pred_random"      # overridden per-seed by _run_seed
+PLOTS_BASE_DIR = "plots_random"
 PLOT_AFFINE = False
 PLOT_EVERY = 1
 
@@ -122,9 +117,9 @@ def infer_scaled_space(path: Optional[str] = None) -> bool:
 
 def build_run_name(seeds: list[int], iterations: int, data_tag: str) -> str:
     date_str = datetime.date.today().isoformat()
-    method = "const"
+    method = "random"
     prior_tag = "-noprior"
-    acq = "feasibility"
+    acq = "random"
     return f"{date_str}_{method}{prior_tag}_{acq}_{data_tag}_{len(seeds)}x{iterations}"
 
 # =================== Hypervolume (EXACT; NOT EHVI) ===================
@@ -397,10 +392,9 @@ def gp_predict_all(models: Models, X: np.ndarray, df_rows: pd.DataFrame
     sigmas = np.maximum(sigmas, EPS)
     return means, sigmas, mu_bcc_logit, sd_bcc
 
-def select_next_by_acq(acq_full: np.ndarray, df: pd.DataFrame, df_pool: pd.DataFrame) -> int:
+def select_next_random(df_pool: pd.DataFrame) -> int:
     pool_labels = df_pool.index.to_numpy()
-    best_rel = int(np.argmax(acq_full[pool_labels]))
-    return int(pool_labels[best_rel])
+    return int(np.random.choice(pool_labels))
 
 # =================== Main loop ===================
 
@@ -550,7 +544,7 @@ def run_campaign(seed: int = 0, iterations: int = 100) -> None:
         df["Prob_All_NoBCC"] = total_prob_no_bcc
         df["Total_Prob_With_BCC"] = total_prob_with_bcc
 
-        # --------- Acquisition (feasibility-first) ----------
+        # --------- Acquisition (random) ----------
         acq_full = total_prob_with_bcc
         df["Acq"] = acq_full
         df["AcqNorm"] = acq_full
@@ -590,8 +584,8 @@ def run_campaign(seed: int = 0, iterations: int = 100) -> None:
         # ---------- Hypervolume (raw, BEFORE pick) ----------
         hv_raw_before = hypervolume_exact(pareto_obs_before, REF_POINT)
 
-        # ---------- Select next via acquisition ----------
-        next_idx = select_next_by_acq(acq_full, df, df_pool)
+        # ---------- Select next randomly ----------
+        next_idx = select_next_random(df_pool)
 
         # ---------- Observe phase; conditionally observe objectives ----------
         true_is_bcc_single = (float(df.loc[next_idx, "600C BCC Total"]) == BCC_SINGLE_VALUE)
@@ -797,7 +791,7 @@ def _configure_from_args(args: argparse.Namespace) -> tuple[list[int], int, int]
 
 def _build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="Constraint-satisfaction campaign without priors (feasibility-first)."
+        description="Random acquisition campaign (uniform selection)."
     )
     p.add_argument("--seeds", help="Comma list or ranges, e.g. 1,2,5-8")
     p.add_argument("--iterations", type=int, help="Iterations per seed")
